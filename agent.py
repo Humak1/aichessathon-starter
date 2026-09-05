@@ -387,6 +387,59 @@ def rook_files(board: chess.Board, color: chess.Color) -> int:
     return score
 
 
+# Weight of each attacker type when it bears on a square in the king zone.
+KING_ZONE_WEIGHT = {
+    chess.PAWN: 1,
+    chess.KNIGHT: 2,
+    chess.BISHOP: 2,
+    chess.ROOK: 3,
+    chess.QUEEN: 5,
+}
+
+# Danger in centipawns for a given number of weighted attack units. Rises
+# faster than linearly: two or three attackers on the king is much more
+# than twice as dangerous as one, which a linear scale would understate.
+KING_DANGER = (
+    0, 0, 10, 25, 45, 70, 100, 135, 175, 220,
+    270, 320, 370, 420, 470, 520, 570,
+)
+
+
+def king_zone(king_square: int) -> list[int]:
+    """The king's own square plus its (up to 8) immediately adjacent ones."""
+    kf = chess.square_file(king_square)
+    kr = chess.square_rank(king_square)
+    squares = []
+    for df in (-1, 0, 1):
+        for dr in (-1, 0, 1):
+            f, r = kf + df, kr + dr
+            if 0 <= f <= 7 and 0 <= r <= 7:
+                squares.append(chess.square(f, r))
+    return squares
+
+
+def king_safety(board: chess.Board, color: chess.Color) -> int:
+    """Danger score for `color`'s king from enemy pieces bearing on its
+    zone. The caller scales this by game phase: a king caught in the open
+    matters far less once most attacking material is off the board, but
+    matters a great deal in the middlegame - the exact pattern behind the
+    AlphaGambit loss (queen grabbed pawns, king had no cover, got mated
+    while nominally ahead on material)."""
+    king_sq = board.king(color)
+    if king_sq is None:
+        return 0
+
+    enemy = not color
+    units = 0
+    for sq in king_zone(king_sq):
+        for attacker_sq in board.attackers(enemy, sq):
+            piece = board.piece_type_at(attacker_sq)
+            if piece is not None:
+                units += KING_ZONE_WEIGHT.get(piece, 0)
+
+    return KING_DANGER[min(units, len(KING_DANGER) - 1)]
+
+
 def evaluate(board: chess.Board) -> int:
     """Static score from the side-to-move perspective."""
     white = 0
@@ -429,6 +482,12 @@ def evaluate(board: chess.Board) -> int:
     if bk is not None:
         msq = chess.square_mirror(bk)
         score -= int(KING_MG[msq] * phase_ratio + KING_EG[msq] * (1 - phase_ratio))
+
+    # Dynamic king safety, middlegame only (skip the cost once most attacking
+    # material is gone, since phase_ratio would scale it near zero anyway).
+    if phase_ratio > 0.15:
+        score -= int(king_safety(board, chess.WHITE) * phase_ratio)
+        score += int(king_safety(board, chess.BLACK) * phase_ratio)
 
     # A small tempo term helps quiet equal positions without contaminating
     # repetition semantics.
@@ -788,7 +847,7 @@ def root_search(
     return best, best_score
 
 
-def budget_ms(time_left_ms: int) -> int:
+def budget_ms(time_left_ms: int, urgent: bool = False) -> int:
     # The old implementation hard-capped itself at 5s even with a huge clock.
     # This engine uses a fraction of the remaining clock, while preserving a
     # hard reserve so an unfinished iteration can never consume the position.
@@ -796,6 +855,16 @@ def budget_ms(time_left_ms: int) -> int:
         return max(30, time_left_ms - 20)
 
     target = time_left_ms // 16 + 350
+
+    # Tactically loud positions (we're in check, or the position on the
+    # board right now was reached by a capture) get extra time: this is
+    # exactly the situation where a shallow search misses a piece a couple
+    # of moves deep, which is what cost the Round 15 loss - the engine had
+    # ~1.8s at a critical moment and never looked far enough to see Qxe8+
+    # coming after Qxb2.
+    if urgent:
+        target = int(target * 1.6)
+
     target = min(MOVE_CAP_MS, max(MIN_BUDGET_MS, target))
     target = min(target, max(MIN_BUDGET_MS, time_left_ms - RESERVE_MS))
     return target
@@ -803,6 +872,19 @@ def budget_ms(time_left_ms: int) -> int:
 
 def record_game_position(key: Any) -> None:
     GAME_REPETITIONS[key] = GAME_REPETITIONS.get(key, 0) + 1
+
+
+def any_piece_attacked(board: chess.Board, color: chess.Color) -> bool:
+    """True if any of `color`'s own pieces are currently attacked by the
+    enemy. Catches threats a capture/check check misses entirely - e.g. a
+    quiet queen move that lines up on an undefended rook, exactly the shape
+    of the Round 15 loss (Qf7 attacked the rook on e8 with no capture and
+    no check involved)."""
+    enemy = not color
+    for square, piece in board.piece_map().items():
+        if piece.color == color and board.is_attacked_by(enemy, square):
+            return True
+    return False
 
 
 def emergency_move(board: chess.Board) -> chess.Move:
@@ -832,7 +914,18 @@ def get_move(fen: str, time_left_ms: int) -> str:
             board.pop()
         return move.uci()
 
-    budget = budget_ms(time_left_ms)
+    # "Urgent" = we're in check, the position arose from a capture, or any
+    # of our own pieces are currently attacked - the last case is what the
+    # Round 15 loss actually needed: Qf7 threatened the rook on e8 without
+    # capturing anything or giving check, so neither of the first two
+    # signals fired there.
+    urgent = (
+        board.is_check()
+        or board.halfmove_clock == 0
+        or any_piece_attacked(board, board.turn)
+    )
+
+    budget = budget_ms(time_left_ms, urgent)
     deadline = time.perf_counter() + budget / 1000.0
     state = SearchState(
         deadline=deadline,
